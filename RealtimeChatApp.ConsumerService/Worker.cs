@@ -1,4 +1,5 @@
 ﻿using Microsoft.AspNetCore.SignalR.Client;
+using Polly;
 using RealtimeChatApp.ConsumerService.Models;
 using RealtimeChatApp.ConsumerService.RabbitMQ;
 using System.Net.Http.Json;
@@ -60,44 +61,72 @@ namespace RealtimeChatApp.ConsumerService
 
         private async Task EnsureHubConnectedAsync(CancellationToken cancellationToken)
         {
-            var connectionInfosForWorkerAuth = _configuration.GetSection("WorkerAuth");
+            var workerAuth = _configuration.GetSection("WorkerAuth");
+            var userName = workerAuth["ServiceUser"];
+            var password = workerAuth["ServiceSecret"];
+            var authEndpoint = workerAuth["WorkerAuthEndpoint"];
 
-            var _userName = connectionInfosForWorkerAuth.GetSection("ServiceUser").Value;
-            var _password = connectionInfosForWorkerAuth.GetSection("ServiceSecret").Value;
-            var authEndpoint = connectionInfosForWorkerAuth.GetSection("WorkerAuthEndpoint").Value;
+            // POLLY: Retry 4 times with 5 seconds delay + Circuit Breaker
+            var policy = Policy
+                .Handle<Exception>() // retry on ANY exception
+                .WaitAndRetryAsync(
+                    retryCount: 4,
+                    sleepDurationProvider: attempt => TimeSpan.FromSeconds(5),
+                    onRetry: (exception, delay, retryAttempt, context) =>
+                    {
+                        _logger.LogWarning("⚠ Retry {retryAttempt}/4 after error: {message}", retryAttempt, exception.Message);
+                    })
+                .WrapAsync(
+                    Policy.Handle<Exception>()
+                          .CircuitBreakerAsync(
+                              exceptionsAllowedBeforeBreaking: 1,
+                              durationOfBreak: TimeSpan.FromSeconds(5),
+                              onBreak: (ex, ts) =>
+                              {
+                                  _logger.LogError("🛑 Circuit broken! Breaking for {seconds} sec. Reason: {msg}", ts.TotalSeconds, ex.Message);
+                              },
+                              onReset: () =>
+                              {
+                                  _logger.LogInformation("🔄 Circuit closed. Ready again.");
+                              })
+                );
 
-            using var http = new HttpClient();
-            var loginResponse = await http.PostAsJsonAsync(authEndpoint , new
+            // Execute with policy
+            await policy.ExecuteAsync(async () =>
             {
-                username = _userName,
-                password = _password
-            });
+                using var http = new HttpClient();
 
-            if (!loginResponse.IsSuccessStatusCode)
-            {
-                _logger.LogError("❌ Worker login başarısız! Status: {status}", loginResponse.StatusCode);
-                return;
-            }
-
-            var json = await loginResponse.Content.ReadFromJsonAsync<WorkerLoginResponse>();
-            var token = json?.Token;
-
-            if (string.IsNullOrEmpty(token))
-            {
-                _logger.LogError("❌ Token alınamadı!");
-                return;
-            }
-
-            _hubConnection = new HubConnectionBuilder()
-                .WithUrl($"https://localhost:7281/workerhub?access_token={token}", options =>
+                var loginResponse = await http.PostAsJsonAsync(authEndpoint, new
                 {
-                    options.AccessTokenProvider = () => Task.FromResult(token);
-                })
-                .WithAutomaticReconnect()
-                .Build();
+                    username = userName,
+                    password = password
+                });
 
-            await _hubConnection.StartAsync(cancellationToken);
-            _logger.LogInformation("✅ Worker Service connected to SignalR WorkerHub.");
+                if (!loginResponse.IsSuccessStatusCode)
+                {
+                    throw new Exception($"Worker login failed. Status: {loginResponse.StatusCode}");
+                }
+
+                var json = await loginResponse.Content.ReadFromJsonAsync<WorkerLoginResponse>();
+                var token = json?.Token;
+
+                if (string.IsNullOrEmpty(token))
+                {
+                    throw new Exception("Token not received.");
+                }
+
+                _hubConnection = new HubConnectionBuilder()
+                    .WithUrl($"https://localhost:7281/workerhub?access_token={token}", options =>
+                    {
+                        options.AccessTokenProvider = () => Task.FromResult(token);
+                    })
+                    .WithAutomaticReconnect()
+                    .Build();
+
+                await _hubConnection.StartAsync(cancellationToken);
+
+                _logger.LogInformation("✅ Worker Service connected to SignalR WorkerHub.");
+            });
         }
     }
 }
